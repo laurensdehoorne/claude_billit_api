@@ -1,6 +1,6 @@
 ---
 name: billit
-description: Use this skill whenever the user asks about their Billit account or invoicing through Billit — sales or purchase invoices ("facturen", "aankoopfacturen", "creditnota"), unpaid or overdue invoices ("openstaande facturen", "wie moet nog betalen"), customers/suppliers ("klanten", "leveranciers"), creating or sending an invoice ("maak een factuur", "verstuur via Peppol"), registering a payment ("markeer als betaald"), or checking whether a company can receive Peppol e-invoices. Uses the billit MCP server tools (billit_*).
+description: Use this skill whenever the user asks about their Billit account or invoicing through Billit — sales or purchase invoices ("facturen", "aankoopfacturen", "creditnota"), unpaid or overdue invoices ("openstaande facturen", "wie moet nog betalen"), customers/suppliers ("klanten", "leveranciers"), creating or sending an invoice ("maak een factuur", "verstuur via Peppol"), registering a payment ("markeer als betaald"), bank statements and CODA files ("rekeninguittreksels", "CODA", ".cod", "banktransacties", "welke betalingen zijn binnen"), or checking whether a company can receive Peppol e-invoices. Uses the billit MCP server tools (billit_*).
 ---
 
 # Billit
@@ -22,6 +22,18 @@ Environment (sandbox/production) is set by `BILLIT_ENV`; the server's instructio
 - `billit_raw_request` covers the rest of the API (reports, Peppol inbox, webhooks, documents…). Swagger: https://api.billit.be/swagger/ui/index
 
 Present lists as compact tables (nummer, datum, klant/leverancier, totaal incl., te betalen, status). Answer in the user's language (usually Dutch).
+
+## Bank statements (CODA)
+
+CODA is the Belgian bank statement format (`.cod`, `.coda`, often `.txt`; fixed-width text of 128 characters per line, first line starts with `0000`).
+
+- `billit_read_coda` reads CODA files from disk **locally** (nothing is uploaded): account, old/new balance with a `balance_check`, and every transaction. Accepts a file or a folder. Use `direction: "credit"` for incoming money, `search` to filter. If `balance_check` is not `ok`, or there is a `warning`, tell the user.
+- `billit_list_transactions` lists bank transactions already in Billit (from imported CODA or bank links).
+- `billit_match_payments` proposes which bank transactions pay which open invoices (sales: incoming money; purchases: outgoing money). Give it `coda_path`, or `date_from`/`date_to` to use Billit's own transactions. It changes nothing.
+  - Show the proposals as a table (date, amount, counterparty, invoice number, open amount, match type, full/partial).
+  - Matches on "structured reference" are reliable; "amount + counterparty name" and especially "amount only" need the user to check them.
+  - Only after explicit confirmation, call `billit_add_payment` with each proposal's `suggested_action.arguments` (the user may pick a subset).
+- `billit_import_coda` uploads CODA files to Billit (write action: confirm first, mention sandbox/production). Importing the same statement twice can create duplicate transactions, so check with `billit_list_transactions` for that period first if unsure.
 
 ## Changing data — always confirm first
 

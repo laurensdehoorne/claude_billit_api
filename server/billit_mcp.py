@@ -22,8 +22,11 @@ import urllib.parse
 import urllib.request
 import uuid
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import coda  # noqa: E402  (local module, next to this file)
+
 SERVER_NAME = "billit"
-SERVER_VERSION = "0.2.0"
+SERVER_VERSION = "0.3.0"
 
 def setting(name, default=""):
     """Plugin setting (BILLIT_CFG_*) first, then the plain environment variable."""
@@ -353,6 +356,219 @@ def t_raw_request(a):
                           party_id=a.get("party_id"))
 
 
+# --------------------------------------------------------------------------- bank / CODA
+
+
+def fetch_all(path, query, party_id, max_pages=25):
+    """Follow Billit paging ($skip, page size 120) and return all Items."""
+    items, skip = [], 0
+    for _ in range(max_pages):
+        q = dict(query)
+        if skip:
+            q["$skip"] = skip
+        res = billit_request("GET", path, query=q, party_id=party_id)
+        batch = (res or {}).get("Items") or [] if isinstance(res, dict) else []
+        items.extend(batch)
+        if not batch or not (isinstance(res, dict) and res.get("NextPageLink")):
+            break
+        skip += len(batch)
+    return items
+
+
+TX_KEYS = ("value_date", "amount", "counterparty_name", "counterparty_account", "structured_reference",
+           "communication", "info", "client_reference", "bank_reference", "transaction_code", "is_detail")
+
+
+def t_read_coda(a):
+    files = coda.coda_files(a["path"])
+    if not files:
+        raise BillitError(f"No CODA files found at {a['path']}")
+    search = (a.get("search") or "").lower()
+    direction = a.get("direction")
+    out = []
+    for f in files:
+        try:
+            statements = coda.read_coda_file(f)
+        except (OSError, ValueError) as e:
+            out.append({"file": f, "error": str(e)})
+            continue
+        for st in statements:
+            txs = st.pop("transactions")
+            if not st.get("free_messages"):
+                st.pop("free_messages", None)
+            if a.get("include_transactions", True):
+                sel = []
+                for t in txs:
+                    if t["is_detail"] and not a.get("include_details"):
+                        continue
+                    if direction == "credit" and t["amount"] <= 0 or direction == "debit" and t["amount"] >= 0:
+                        continue
+                    if search and search not in json.dumps(t, ensure_ascii=False).lower():
+                        continue
+                    sel.append({k: t[k] for k in TX_KEYS if t.get(k) not in (None, False, "")})
+                st["transactions"] = sel
+            out.append(st)
+    return {"statements": out, "files": len(files)}
+
+
+def summarize_tx(t):
+    keys = ("BankAccountTransactionID", "ValueDate", "TotalAmount", "Currency", "NameCounterParty",
+            "IBANCounterParty", "Description", "FreeMessage", "ClientReference", "BankReference",
+            "IBAN", "Note", "AssignedEntities")
+    return {k: t.get(k) for k in keys if t.get(k) not in (None, "", [])}
+
+
+def t_list_transactions(a):
+    extra = []
+    if a.get("date_from"):
+        extra.append(f"ValueDate ge DateTime'{a['date_from']}'")
+    if a.get("date_to"):
+        extra.append(f"ValueDate le DateTime'{a['date_to']}'")
+    args = dict(a)
+    args["filter"] = and_filter(*extra, a.get("filter"))
+    if not args.get("orderby"):
+        args["orderby"] = "ValueDate desc"
+    res = billit_request("GET", "/v1/financialTransactions", query=odata_query(args), party_id=a.get("party_id"))
+    return page(res, summarize_tx, a.get("compact", True))
+
+
+def t_import_coda(a):
+    files = coda.coda_files(a["path"])
+    if not files:
+        raise BillitError(f"No CODA files found at {a['path']}")
+    results = []
+    for f in files:
+        try:
+            statements = coda.read_coda_file(f)  # validate before uploading
+        except (OSError, ValueError) as e:
+            results.append({"file": f, "status": "skipped", "reason": str(e)})
+            continue
+        with open(f, "rb") as fh:
+            content = base64.b64encode(fh.read()).decode("ascii")
+        body = {"FileName": os.path.basename(f), "MimeType": "text/plain", "FileContent": content}
+        try:
+            res = billit_request("POST", "/v1/financialTransactions/importFile", body=body,
+                                 party_id=a.get("party_id"))
+            status = "imported"
+        except BillitError as e:
+            res, status = str(e), "error"
+        results.append({
+            "file": f, "status": status, "response": res,
+            "statements": [{"account": s.get("account"), "statement_sequence": s.get("statement_sequence"),
+                            "transactions": s.get("transaction_count"), "new_balance": s.get("new_balance"),
+                            "new_balance_date": s.get("new_balance_date")} for s in statements],
+        })
+    return {"environment": ENV, "results": results}
+
+
+def _digits(x):
+    return re.sub(r"\D", "", str(x or ""))
+
+
+def _name_tokens(x):
+    stop = {"nv", "bv", "bvba", "sa", "srl", "sprl", "vzw", "cv", "comm", "v", "the", "de", "het", "en"}
+    return {w for w in re.findall(r"[a-z0-9]{3,}", str(x or "").lower()) if w not in stop}
+
+
+def t_match_payments(a):
+    party = a.get("party_id")
+    # 1. bank transactions: from CODA file(s) or from Billit
+    txs = []
+    if a.get("coda_path"):
+        for f in coda.coda_files(a["coda_path"]):
+            for st in coda.read_coda_file(f):
+                for t in st["transactions"]:
+                    if t["is_detail"]:
+                        continue
+                    txs.append({
+                        "source": os.path.basename(f), "date": t["value_date"] or t["entry_date"],
+                        "amount": t["amount"], "counterparty": t["counterparty_name"],
+                        "account": t["counterparty_account"], "ogm": t["structured_reference"],
+                        "text": " ".join(filter(None, [t["communication"], t["info"], t["client_reference"]])),
+                    })
+    else:
+        q = {}
+        flt = []
+        if a.get("date_from"):
+            flt.append(f"ValueDate ge DateTime'{a['date_from']}'")
+        if a.get("date_to"):
+            flt.append(f"ValueDate le DateTime'{a['date_to']}'")
+        if flt:
+            q["$filter"] = " and ".join(flt)
+        for t in fetch_all("/v1/financialTransactions", q, party):
+            text = " ".join(filter(None, [t.get("Description"), t.get("FreeMessage"), t.get("ClientReference")]))
+            txs.append({
+                "source": f"billit:{t.get('BankAccountTransactionID')}", "date": (t.get("ValueDate") or "")[:10],
+                "amount": t.get("TotalAmount") or 0, "counterparty": t.get("NameCounterParty"),
+                "account": t.get("IBANCounterParty"), "ogm": coda.find_ogm(text), "text": text,
+            })
+
+    # 2. open invoices / credit notes (sales and purchases)
+    orders = fetch_all("/v1/orders", {"$filter": "Paid eq false"}, party)
+    orders = [o for o in orders if (o.get("ToPay") or 0) != 0]
+    by_ogm = {}
+    for o in orders:
+        d = _digits(o.get("PaymentReference"))
+        if len(d) == 12:
+            by_ogm.setdefault(d, []).append(o)
+
+    tol = float(a.get("amount_tolerance", 0.01))
+    matches, unmatched, used = [], [], set()
+    for t in txs:
+        amt = round(float(t["amount"]), 2)
+        if amt == 0:
+            continue
+        direction = "Income" if amt > 0 else "Cost"
+        cands = [o for o in orders if o.get("OrderDirection") == direction and o["OrderID"] not in used]
+        hit, how = None, None
+        if t["ogm"]:
+            same = [o for o in by_ogm.get(_digits(t["ogm"]), []) if o in cands]
+            if same:
+                hit, how = same[0], "structured reference"
+        if not hit:
+            text_digits = _digits(t["text"])
+            text_norm = norm(t["text"])
+            for o in cands:
+                num = norm(o.get("OrderNumber"))
+                if len(num) >= 4 and (num in text_norm or (num.isdigit() and num in text_digits)):
+                    hit, how = o, "invoice number in communication"
+                    break
+        if not hit:
+            same_amt = [o for o in cands if abs(abs(amt) - abs(o.get("ToPay") or 0)) <= tol]
+            tokens = _name_tokens(t["counterparty"]) | _name_tokens(t["text"])
+            named = [o for o in same_amt if tokens & _name_tokens(((o.get("CounterParty") or {}).get("DisplayName")))]
+            if len(named) == 1:
+                hit, how = named[0], "amount + counterparty name"
+            elif len(same_amt) == 1 and a.get("allow_amount_only"):
+                hit, how = same_amt[0], "amount only (check!)"
+        if not hit:
+            unmatched.append(t)
+            continue
+        used.add(hit["OrderID"])
+        to_pay = abs(hit.get("ToPay") or 0)
+        paid = abs(amt)
+        coverage = "full" if abs(paid - to_pay) <= tol else ("partial" if paid < to_pay else "overpaid")
+        matches.append({
+            "match": how,
+            "coverage": coverage,
+            "transaction": {k: t[k] for k in ("source", "date", "amount", "counterparty", "ogm") if t.get(k)},
+            "order": {"OrderID": hit["OrderID"], "OrderNumber": hit.get("OrderNumber"),
+                      "Direction": hit.get("OrderDirection"), "Type": hit.get("OrderType"),
+                      "CounterParty": (hit.get("CounterParty") or {}).get("DisplayName"),
+                      "ToPay": hit.get("ToPay"), "PaymentReference": hit.get("PaymentReference")},
+            "suggested_action": {"tool": "billit_add_payment",
+                                 "arguments": {"order_id": hit["OrderID"], "amount": paid, "date": t["date"],
+                                               "description": f"Bank {t['source']}"}},
+        })
+    return {
+        "note": "Proposals only — nothing was changed. Confirm with the user before calling billit_add_payment.",
+        "transactions_checked": len(txs), "open_documents": len(orders),
+        "matches": matches,
+        "unmatched_count": len(unmatched),
+        "unmatched": unmatched[: int(a.get("max_unmatched", 30))],
+    }
+
+
 # --------------------------------------------------------------------------- tool registry
 
 
@@ -410,7 +626,37 @@ TOOLS = [
           "query": {"type": "object", "description": "Query parameters"},
           "body": {"type": "object", "description": "JSON body"}},
          ["method", "path"], t_raw_request),
+    tool("billit_read_coda",
+         "Read Belgian CODA bank statement file(s) from disk (a .cod file or a folder of them) without uploading: "
+         "account, old/new balance (with a balance check), and every transaction with date, amount, counterparty, "
+         "IBAN, structured reference (+++.../.../...+++) and communication.",
+         {"path": {"type": "string", "description": "CODA file or directory"},
+          "direction": {"type": "string", "enum": ["credit", "debit"], "description": "Only incoming or outgoing money"},
+          "search": {"type": "string", "description": "Only transactions containing this text"},
+          "include_transactions": {"type": "boolean", "description": "Default true; false gives only statement totals"},
+          "include_details": {"type": "boolean", "description": "Also list the detail lines of globalised (grouped) movements"}},
+         ["path"], t_read_coda),
+    tool("billit_list_transactions",
+         "List bank transactions known in Billit (from imported CODA files or bank links).",
+         {"date_from": {"type": "string", "description": "YYYY-MM-DD (ValueDate >=)"},
+          "date_to": {"type": "string", "description": "YYYY-MM-DD (ValueDate <=)"},
+          "compact": {"type": "boolean"}, **ODATA_ARGS}, [], t_list_transactions),
+    tool("billit_match_payments",
+         "Match bank transactions (from a CODA file, or from Billit for a date range) to unpaid sales and purchase "
+         "invoices, using the structured payment reference, the invoice number in the communication, or amount + "
+         "counterparty name. Read-only: returns proposals with a ready billit_add_payment call for each.",
+         {"coda_path": {"type": "string", "description": "CODA file or folder; omit to use Billit's transactions"},
+          "date_from": {"type": "string", "description": "YYYY-MM-DD, when using Billit's transactions"},
+          "date_to": {"type": "string"},
+          "amount_tolerance": {"type": "number", "description": "Default 0.01"},
+          "allow_amount_only": {"type": "boolean", "description": "Also propose matches on a unique amount alone (less reliable)"},
+          "max_unmatched": {"type": "integer"}},
+         [], t_match_payments),
     # ---- write tools
+    tool("billit_import_coda",
+         "Upload CODA bank statement file(s) to Billit and import the transactions. Each file is validated locally "
+         "first. Confirm with the user before calling.",
+         {"path": {"type": "string", "description": "CODA file or directory"}}, ["path"], t_import_coda, write=True),
     tool("billit_create_order",
          "Create (or update, when OrderID is included) an invoice, credit note or quote. Does NOT send it. "
          "Pass the Billit order JSON, e.g. {\"OrderType\":\"Invoice\",\"OrderDirection\":\"Income\",\"OrderNumber\":\"2026-001\","
@@ -482,6 +728,8 @@ def handle(msg):
             return text_result(t["_fn"](params.get("arguments") or {}))
         except BillitError as e:
             return text_result(str(e), True)
+        except OSError as e:
+            return text_result(f"File error: {e}", True)
         except (KeyError, ValueError, TypeError) as e:
             return text_result(f"Invalid arguments: {e!r}", True)
     raise LookupError(method)
