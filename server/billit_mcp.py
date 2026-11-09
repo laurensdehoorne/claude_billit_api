@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Billit MCP server (stdio, no external dependencies).
 
-Configuration via environment variables:
+Configuration (plugin settings in Claude Code, or environment variables):
   BILLIT_API_KEY    API key from My Billit (required for most tools)
-  BILLIT_PARTY_ID   PartyID of the company to act for (can be overridden per call)
+  BILLIT_COMPANY    optional: VAT number, company name or PartyID of the company to act for.
+                    Not needed when the API key has access to one company only.
+  BILLIT_PARTY_ID   optional, legacy alias for BILLIT_COMPANY
   BILLIT_ENV        "sandbox" (default) or "production"
+The plugin passes its settings as BILLIT_CFG_*; those win over the plain variables.
   BILLIT_BASE_URL   optional: override the API base URL
   BILLIT_READ_ONLY  "true" to hide every tool that changes data
 """
@@ -12,6 +15,7 @@ Configuration via environment variables:
 import base64
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.parse
@@ -19,14 +23,23 @@ import urllib.request
 import uuid
 
 SERVER_NAME = "billit"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.2.0"
 
-ENV = os.environ.get("BILLIT_ENV", "sandbox").strip().lower() or "sandbox"
+def setting(name, default=""):
+    """Plugin setting (BILLIT_CFG_*) first, then the plain environment variable."""
+    for key in ("BILLIT_CFG_" + name, "BILLIT_" + name):
+        val = (os.environ.get(key) or "").strip()
+        if val and not val.startswith("${"):  # ignore unexpanded placeholders
+            return val
+    return default
+
+
+ENV = setting("ENV", "sandbox").lower()
 BASE_URL = os.environ.get("BILLIT_BASE_URL") or (
     "https://api.billit.be" if ENV == "production" else "https://api.sandbox.billit.be"
 )
-API_KEY = os.environ.get("BILLIT_API_KEY", "").strip()
-DEFAULT_PARTY_ID = os.environ.get("BILLIT_PARTY_ID", "").strip()
+API_KEY = setting("API_KEY")
+DEFAULT_COMPANY = setting("COMPANY") or setting("PARTY_ID")
 READ_ONLY = os.environ.get("BILLIT_READ_ONLY", "").strip().lower() in ("1", "true", "yes")
 
 MAX_TEXT = 60_000  # keep tool results within a sane size for the model
@@ -52,11 +65,11 @@ def billit_request(method, path, query=None, body=None, party_id=None, auth=True
     if auth:
         if not API_KEY:
             raise BillitError(
-                "BILLIT_API_KEY is not set. Set it (and BILLIT_PARTY_ID) in your environment "
-                "before starting Claude Code. See the plugin README."
+                "No Billit API key configured. Set it in the plugin settings (/plugin -> billit -> "
+                "configure) or export BILLIT_API_KEY before starting Claude Code. See the README."
             )
         headers["ApiKey"] = API_KEY
-        pid = str(party_id or DEFAULT_PARTY_ID or "").strip()
+        pid = resolve_party_id(party_id)
         if pid:
             headers["PartyID"] = pid
     if extra_headers:
@@ -84,6 +97,58 @@ def billit_request(method, path, query=None, body=None, party_id=None, auth=True
         return json.loads(raw.decode("utf-8"))
     except ValueError:
         return {"status": status, "raw": raw.decode("utf-8", "replace")}
+
+
+_companies_cache = None
+
+
+def norm(text):
+    return re.sub(r"[^0-9a-z]", "", str(text or "").lower())
+
+
+def list_companies():
+    global _companies_cache
+    if _companies_cache is None:
+        info = billit_request("GET", "/v1/account/accountInformation", party_id="-")
+        _companies_cache = (info or {}).get("Companies") or []
+    return _companies_cache
+
+
+def resolve_party_id(company):
+    """Turn a PartyID, VAT number or company name into a PartyID.
+
+    "-" means: send no PartyID header (used for the account lookup itself).
+    """
+    company = str(company or DEFAULT_COMPANY or "").strip()
+    if company == "-":
+        return ""
+    if company.isdigit() and len(company) < 9:  # a PartyID
+        return company
+    companies = list_companies()
+    if not company:
+        if len(companies) == 1:
+            return str(companies[0].get("PartyID"))
+        if not companies:
+            return ""
+        raise BillitError(
+            "This API key has access to several companies; choose one by VAT number or name "
+            "(plugin setting 'company', or the party_id argument): "
+            + "; ".join(f"{c.get('Name')} ({c.get('VATNumber')}, PartyID {c.get('PartyID')})" for c in companies)
+        )
+    want = norm(company)
+    want_digits = re.sub(r"\D", "", company)
+    if len(want_digits) >= 9:  # looks like a VAT / company number
+        for c in companies:
+            if re.sub(r"\D", "", str(c.get("VATNumber") or "")).lstrip("0") == want_digits.lstrip("0"):
+                return str(c.get("PartyID"))
+        if company.isdigit():  # long number that is no known VAT number: treat as PartyID
+            return company
+    matches = [c for c in companies
+               if want and (want in norm(c.get("Name")) or want in norm(c.get("CommercialName")))]
+    if len(matches) == 1:
+        return str(matches[0].get("PartyID"))
+    names = ", ".join(f"{c.get('Name')} ({c.get('VATNumber')})" for c in (matches or companies))
+    raise BillitError(f"Company '{company}' not found unambiguously. Available: {names}")
 
 
 def odata_query(args):
@@ -149,8 +214,8 @@ def page(result, mapper, compact):
 PARTY_ARG = {
     "party_id": {
         "type": "string",
-        "description": "Optional PartyID of the company to act for (defaults to BILLIT_PARTY_ID). "
-                       "Use billit_account_info to list the companies you can access.",
+        "description": "Optional company to act for: PartyID, VAT number or company name "
+                       "(defaults to the configured company). billit_account_info lists the companies you can access.",
     }
 }
 ODATA_ARGS = {
@@ -163,7 +228,15 @@ ODATA_ARGS = {
 
 
 def t_account_info(a):
-    return billit_request("GET", "/v1/account/accountInformation", party_id=a.get("party_id"))
+    info = billit_request("GET", "/v1/account/accountInformation", party_id="-")
+    companies = (info or {}).get("Companies") or []
+    return {
+        "User": " ".join(filter(None, [info.get("FirstName"), info.get("LastName")])) or info.get("Email"),
+        "Email": info.get("Email"),
+        "Environment": ENV,
+        "Companies": [{k: c.get(k) for k in ("PartyID", "Name", "CommercialName", "VATNumber", "City", "PeppolIdentifier")}
+                      for c in companies],
+    }
 
 
 def t_list_orders(a):
@@ -209,8 +282,7 @@ def t_list_products(a):
 
 def t_peppol_check(a):
     ident = urllib.parse.quote(a["identifier"].replace(" ", "").replace(".", ""), safe=":")
-    return billit_request("GET", f"/v1/peppol/participantInformation/{ident}", auth=bool(API_KEY),
-                          party_id=a.get("party_id"))
+    return billit_request("GET", f"/v1/peppol/participantInformation/{ident}", auth=False)
 
 
 def t_company_search(a):

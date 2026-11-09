@@ -10,7 +10,7 @@ Environment (sandbox/production) is set by `BILLIT_ENV`; the server's instructio
 
 ## Reading data
 
-- Start with `billit_account_info` if you don't know which company (PartyID) to use, or if the user has several companies.
+- Start with `billit_account_info` if you don't know which company to use. Every tool takes an optional `party_id`, which accepts a PartyID, a VAT number or a company name.
 - `billit_list_orders` is the main search tool. Prefer its convenience args:
   - `direction`: `Income` (verkoop) or `Cost` (aankoop)
   - `order_type`: `Invoice`, `CreditNote`, `Offer`
@@ -72,6 +72,7 @@ Notes:
 
 ## Errors
 
-- "BILLIT_API_KEY is not set": tell the user to export `BILLIT_API_KEY` and `BILLIT_PARTY_ID` (see the plugin README) and restart Claude Code.
+- "No Billit API key configured": tell the user to fill in the plugin settings (`/plugin` → billit → configure) and restart Claude Code.
+- "access to several companies": ask which company, then pass its VAT number or name as `party_id` (or suggest setting the plugin's "Bedrijf" setting).
 - HTTP 401/403: wrong key, wrong PartyID, or a sandbox key used against production (or vice versa).
 - Validation errors on send: show Billit's message, fix the invoice with `billit_update_order`, then retry.
