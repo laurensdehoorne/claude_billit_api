@@ -1,0 +1,7 @@
+{
+  "name": "billit",
+  "version": "0.1.0",
+  "description": "Werk met Billit (facturatie & Peppol) vanuit Claude: facturen opzoeken, aanmaken, versturen, betalingen registreren, klanten beheren en Peppol-ontvangers checken.",
+  "author": { "name": "Laurens De Hoorne" },
+  "keywords": ["billit", "invoicing", "peppol", "facturatie", "belgium"]
+}

@@ -1,0 +1,7 @@
+{
+  "name": "billit-local",
+  "owner": { "name": "Laurens De Hoorne" },
+  "plugins": [
+    { "name": "billit", "source": "./", "description": "Billit API tools voor Claude" }
+  ]
+}
