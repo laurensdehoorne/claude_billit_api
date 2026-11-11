@@ -6,7 +6,8 @@ Configuration (plugin settings in Claude Code, or environment variables):
   BILLIT_COMPANY    optional: VAT number, company name or PartyID of the company to act for.
                     Not needed when the API key has access to one company only.
   BILLIT_PARTY_ID   optional, legacy alias for BILLIT_COMPANY
-  BILLIT_ENV        "sandbox" (default) or "production"
+  BILLIT_ENV        "sandbox" (default; also "test") or "production" (also "productie", "prod", "live");
+                    case-insensitive. Any other value makes the API tools return an error.
 The plugin passes its settings as BILLIT_CFG_*; those win over the plain variables.
   BILLIT_BASE_URL   optional: override the API base URL
   BILLIT_READ_ONLY  "true" to hide every tool that changes data
@@ -26,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import coda  # noqa: E402  (local module, next to this file)
 
 SERVER_NAME = "billit"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.3.1"
 
 def setting(name, default=""):
     """Plugin setting (BILLIT_CFG_*) first, then the plain environment variable."""
@@ -37,7 +38,17 @@ def setting(name, default=""):
     return default
 
 
-ENV = setting("ENV", "sandbox").lower()
+ENV_ALIASES = {
+    "production": "production", "productie": "production", "prod": "production", "live": "production",
+    "sandbox": "sandbox", "test": "sandbox", "": "sandbox",
+}
+ENV_RAW = setting("ENV", "sandbox")
+ENV = ENV_ALIASES.get(ENV_RAW.strip().lower())  # None = unrecognised value
+ENV_ERROR = None if ENV else (
+    f"Unrecognised Billit environment {ENV_RAW!r}. Use 'production' (or productie/prod/live) "
+    "or 'sandbox' (or test) in the plugin settings (BILLIT_ENV). "
+    "No request was sent, to avoid calling the wrong Billit environment."
+)
 BASE_URL = os.environ.get("BILLIT_BASE_URL") or (
     "https://api.billit.be" if ENV == "production" else "https://api.sandbox.billit.be"
 )
@@ -63,6 +74,9 @@ def billit_request(method, path, query=None, body=None, party_id=None, auth=True
         q = {k: v for k, v in query.items() if v not in (None, "")}
         if q:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(q, quote_via=urllib.parse.quote)
+
+    if ENV_ERROR and not os.environ.get("BILLIT_BASE_URL"):
+        raise BillitError(ENV_ERROR)
 
     headers = {"Accept": "application/json", "User-Agent": f"billit-claude-plugin/{SERVER_VERSION}"}
     if auth:
@@ -710,7 +724,7 @@ def handle(msg):
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             "instructions": (
-                f"Billit API ({ENV}, {BASE_URL}). "
+                (f"Configuration error: {ENV_ERROR} " if ENV_ERROR else f"Billit API ({ENV}, {BASE_URL}). ")
                 + ("Read-only mode. " if READ_ONLY else "")
                 + "Amounts are EUR unless Currency says otherwise. Never send invoices "
                   "or change data without explicit user confirmation."
