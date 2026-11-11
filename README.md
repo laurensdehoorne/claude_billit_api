@@ -29,7 +29,7 @@ Bij het inschakelen vraagt Claude Code drie instellingen. Later aanpassen kan vi
 | Instelling | Wat |
 |---|---|
 | **Billit API-sleutel** | My Billit → Profiel → API. Wordt veilig bewaard (keychain), niet in een tekstbestand. |
-| **Omgeving** | `sandbox` (standaard) of `production`. Sandbox en productie hebben elk een eigen sleutel. |
+| **Omgeving** | `sandbox` (standaard) of `production`. Sandbox en productie hebben elk een eigen sleutel. Hoofdletters en spaties maken niet uit; `productie`, `prod` en `live` betekenen ook productie, `test` betekent sandbox. Bij een andere waarde geven de tools een foutmelding in plaats van stilletjes de sandbox te gebruiken. |
 | **Bedrijf** (optioneel) | Je **btw-nummer** (bv. `BE0123456789`, puntjes mogen), de **bedrijfsnaam**, of de PartyID. Leeg laten als je maar één bedrijf hebt. |
 
 Een PartyID opzoeken is dus niet nodig: de plugin vraagt met je sleutel zelf op tot welke bedrijven je toegang hebt.
