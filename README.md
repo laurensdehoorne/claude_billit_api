@@ -22,33 +22,47 @@ claude plugin install billit@billit-local
 
 Of in Claude Code: `/plugin marketplace add laurensdehoorne/claude_billit_api` en daarna `/plugin install billit@billit-local`.
 
-## 2. Instellen (in Claude Code zelf)
+## 2. Instellen (configbestand)
 
-Bij het inschakelen vraagt Claude Code drie instellingen. Later aanpassen kan via `/plugin` → billit → configureren.
+De server leest zijn instellingen uit **`~/.config/billit/config.json`**. Zo werkt hij zowel in Claude Code als in Cowork (de desktop-app start geen plugin-servers die plugin-instellingen gebruiken).
 
-| Instelling | Wat |
+```bash
+mkdir -p ~/.config/billit
+cat > ~/.config/billit/config.json <<'JSON'
+{
+  "api_key": "PLAK-HIER-JE-SLEUTEL",
+  "environment": "production",
+  "company": ""
+}
+JSON
+chmod 600 ~/.config/billit/config.json
+```
+
+| Sleutel | Wat |
 |---|---|
-| **Billit API-sleutel** | My Billit → Profiel → API. Wordt veilig bewaard (keychain), niet in een tekstbestand. |
-| **Omgeving** | `sandbox` (standaard) of `production`. Sandbox en productie hebben elk een eigen sleutel. Hoofdletters en spaties maken niet uit; `productie`, `prod` en `live` betekenen ook productie, `test` betekent sandbox. Bij een andere waarde geven de tools een foutmelding in plaats van stilletjes de sandbox te gebruiken. |
-| **Bedrijf** (optioneel) | Je **btw-nummer** (bv. `BE0123456789`, puntjes mogen), de **bedrijfsnaam**, of de PartyID. Leeg laten als je maar één bedrijf hebt. |
+| **api_key** | My Billit → Profiel → API. Het bestand is alleen voor jou leesbaar (`chmod 600`). |
+| **environment** | `sandbox` (standaard) of `production`. Sandbox en productie hebben elk een eigen sleutel. Hoofdletters en spaties maken niet uit; `productie`, `prod` en `live` betekenen ook productie, `test` betekent sandbox. Bij een andere waarde geven de tools een foutmelding in plaats van stilletjes de sandbox te gebruiken. |
+| **company** (optioneel) | Je **btw-nummer** (bv. `BE0123456789`, puntjes mogen), de **bedrijfsnaam**, of de PartyID. Leeg laten als je maar één bedrijf hebt. |
+| **read_only** (optioneel) | `true` om alle tools die iets wijzigen te verbergen. |
 
 Een PartyID opzoeken is dus niet nodig: de plugin vraagt met je sleutel zelf op tot welke bedrijven je toegang hebt.
 Werk je voor meerdere bedrijven, zeg dan gewoon tegen Claude voor welk bedrijf (naam of btw-nummer).
 
-Herstart Claude Code en check met `/mcp` dat de `billit`-server verbonden is. Vraag daarna bv. "toon mijn Billit-accountinfo".
+Start daarna een **nieuw gesprek** (de server laadt alleen bij het begin van een sessie) en vraag bv. "toon mijn Billit-accountinfo".
 
 > Billit staat API-keys alleen toe voor eigen, niet-commerciële integraties — precies dit gebruik. Begin op de sandbox (https://my.sandbox.billit.be).
 
 <details>
 <summary>Alternatief: omgevingsvariabelen</summary>
 
-Als je de plugin-instellingen leeg laat, leest de server deze variabelen uit je shell:
+Omgevingsvariabelen gaan voor op het configbestand:
 
 ```bash
 export BILLIT_API_KEY="..."
 export BILLIT_COMPANY="BE0123456789"   # optioneel: btw-nummer, naam of PartyID
 export BILLIT_ENV="sandbox"            # of "production"
 export BILLIT_READ_ONLY="true"         # optioneel: enkel lezen, geen schrijf-tools
+export BILLIT_CONFIG="/ander/pad.json" # optioneel: ander configbestand
 ```
 </details>
 

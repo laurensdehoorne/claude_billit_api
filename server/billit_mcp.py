@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 """Billit MCP server (stdio, no external dependencies).
 
-Configuration (plugin settings in Claude Code, or environment variables):
-  BILLIT_API_KEY    API key from My Billit (required for most tools)
+Configuration: a JSON file, by default ~/.config/billit/config.json (override the path with
+BILLIT_CONFIG), for example
+  {"api_key": "...", "environment": "production", "company": "BE0123456789"}
+Keys: api_key (required for most tools), environment, company, read_only.
+Environment variables win over the file:
+  BILLIT_API_KEY    API key from My Billit
   BILLIT_COMPANY    optional: VAT number, company name or PartyID of the company to act for.
                     Not needed when the API key has access to one company only.
   BILLIT_PARTY_ID   optional, legacy alias for BILLIT_COMPANY
   BILLIT_ENV        "sandbox" (default; also "test") or "production" (also "productie", "prod", "live");
                     case-insensitive. Any other value makes the API tools return an error.
-The plugin passes its settings as BILLIT_CFG_*; those win over the plain variables.
   BILLIT_BASE_URL   optional: override the API base URL
   BILLIT_READ_ONLY  "true" to hide every tool that changes data
+BILLIT_CFG_* variables (older plugin versions) are still honoured and win over BILLIT_*.
+The plugin itself passes no settings: Claude's desktop app (Cowork) refuses to start plugin
+servers that use plugin user settings, so the server reads its own config file instead.
 """
 
 import base64
@@ -27,15 +33,44 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import coda  # noqa: E402  (local module, next to this file)
 
 SERVER_NAME = "billit"
-SERVER_VERSION = "0.3.1"
+SERVER_VERSION = "0.4.0"
+
+def _home():
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_dir
+    except Exception:
+        return os.path.expanduser("~")
+
+
+CONFIG_PATH = os.environ.get("BILLIT_CONFIG") or os.path.join(_home(), ".config", "billit", "config.json")
+CONFIG_ERROR = None
+FILE_CONFIG = {}
+if os.path.exists(CONFIG_PATH):
+    try:
+        with open(CONFIG_PATH, encoding="utf-8") as fh:
+            FILE_CONFIG = json.load(fh)
+        if not isinstance(FILE_CONFIG, dict):
+            raise ValueError("expected a JSON object")
+    except (OSError, ValueError) as e:
+        FILE_CONFIG = {}
+        CONFIG_ERROR = f"Could not read the Billit config file {CONFIG_PATH}: {e}"
+
+FILE_KEYS = {"API_KEY": "api_key", "ENV": "environment", "COMPANY": "company",
+             "PARTY_ID": "party_id", "READ_ONLY": "read_only"}
+
 
 def setting(name, default=""):
-    """Plugin setting (BILLIT_CFG_*) first, then the plain environment variable."""
+    """Environment (BILLIT_CFG_*, then BILLIT_*) first, then the config file."""
     for key in ("BILLIT_CFG_" + name, "BILLIT_" + name):
         val = (os.environ.get(key) or "").strip()
         if val and not val.startswith("${"):  # ignore unexpanded placeholders
             return val
-    return default
+    val = FILE_CONFIG.get(FILE_KEYS.get(name, name.lower()))
+    if isinstance(val, bool):
+        val = "true" if val else "false"
+    val = str(val if val is not None else "").strip()
+    return val or default
 
 
 ENV_ALIASES = {
@@ -46,7 +81,7 @@ ENV_RAW = setting("ENV", "sandbox")
 ENV = ENV_ALIASES.get(ENV_RAW.strip().lower())  # None = unrecognised value
 ENV_ERROR = None if ENV else (
     f"Unrecognised Billit environment {ENV_RAW!r}. Use 'production' (or productie/prod/live) "
-    "or 'sandbox' (or test) in the plugin settings (BILLIT_ENV). "
+    f"or 'sandbox' (or test) as \"environment\" in {CONFIG_PATH} (or BILLIT_ENV). "
     "No request was sent, to avoid calling the wrong Billit environment."
 )
 BASE_URL = os.environ.get("BILLIT_BASE_URL") or (
@@ -54,7 +89,7 @@ BASE_URL = os.environ.get("BILLIT_BASE_URL") or (
 )
 API_KEY = setting("API_KEY")
 DEFAULT_COMPANY = setting("COMPANY") or setting("PARTY_ID")
-READ_ONLY = os.environ.get("BILLIT_READ_ONLY", "").strip().lower() in ("1", "true", "yes")
+READ_ONLY = setting("READ_ONLY").lower() in ("1", "true", "yes")
 
 MAX_TEXT = 60_000  # keep tool results within a sane size for the model
 
@@ -75,6 +110,8 @@ def billit_request(method, path, query=None, body=None, party_id=None, auth=True
         if q:
             url += ("&" if "?" in url else "?") + urllib.parse.urlencode(q, quote_via=urllib.parse.quote)
 
+    if CONFIG_ERROR:
+        raise BillitError(CONFIG_ERROR)
     if ENV_ERROR and not os.environ.get("BILLIT_BASE_URL"):
         raise BillitError(ENV_ERROR)
 
@@ -82,8 +119,9 @@ def billit_request(method, path, query=None, body=None, party_id=None, auth=True
     if auth:
         if not API_KEY:
             raise BillitError(
-                "No Billit API key configured. Set it in the plugin settings (/plugin -> billit -> "
-                "configure) or export BILLIT_API_KEY before starting Claude Code. See the README."
+                f"No Billit API key configured. Put it in {CONFIG_PATH} as "
+                '{"api_key": "...", "environment": "production"} (or export BILLIT_API_KEY), '
+                "then start a new conversation. See the README."
             )
         headers["ApiKey"] = API_KEY
         pid = resolve_party_id(party_id)
@@ -724,7 +762,9 @@ def handle(msg):
             "capabilities": {"tools": {"listChanged": False}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
             "instructions": (
-                (f"Configuration error: {ENV_ERROR} " if ENV_ERROR else f"Billit API ({ENV}, {BASE_URL}). ")
+                (f"Configuration error: {CONFIG_ERROR or ENV_ERROR} " if (CONFIG_ERROR or ENV_ERROR)
+                 else f"Billit API ({ENV}, {BASE_URL}). ")
+                + ("" if API_KEY else f"No API key configured yet (expected in {CONFIG_PATH}). ")
                 + ("Read-only mode. " if READ_ONLY else "")
                 + "Amounts are EUR unless Currency says otherwise. Never send invoices "
                   "or change data without explicit user confirmation."

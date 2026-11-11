@@ -6,7 +6,7 @@ description: Use this skill whenever the user asks about their Billit account or
 # Billit
 
 The `billit` MCP server (tools named `billit_*`) talks to the Billit REST API.
-Environment (sandbox/production) is set by `BILLIT_ENV`; the server's instructions say which one is active. Mention it when you create or send something.
+Environment (sandbox/production) is set by `environment` in `~/.config/billit/config.json` (or `BILLIT_ENV`); the server's instructions say which one is active. Mention it when you create or send something.
 
 ## Reading data
 
@@ -84,7 +84,7 @@ Notes:
 
 ## Errors
 
-- "No Billit API key configured": tell the user to fill in the plugin settings (`/plugin` → billit → configure) and restart Claude Code.
-- "access to several companies": ask which company, then pass its VAT number or name as `party_id` (or suggest setting the plugin's "Bedrijf" setting).
+- "No Billit API key configured": tell the user to put their key in `~/.config/billit/config.json` (`{"api_key": "...", "environment": "production"}`, see the README) and start a new conversation. Never ask them to paste the key in chat.
+- "access to several companies": ask which company, then pass its VAT number or name as `party_id` (or suggest setting `company` in the config file).
 - HTTP 401/403: wrong key, wrong PartyID, or a sandbox key used against production (or vice versa).
 - Validation errors on send: show Billit's message, fix the invoice with `billit_update_order`, then retry.
